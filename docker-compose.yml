@@ -1,0 +1,262 @@
+# Smart-Grid Energy Monitoring and Billing - local stack.
+#   docker compose up -d --build          start everything
+#   docker compose --profile test run --rm tests   run the test suite
+# Every setting below can be overridden from a .env file (see .env.example).
+
+name: smartgrid
+
+x-sim-env: &sim-env
+  NUM_HOUSEHOLDS: ${NUM_HOUSEHOLDS:-12}
+  NUM_ZONES: ${NUM_ZONES:-3}
+  SIM_DAY_SECONDS: ${SIM_DAY_SECONDS:-300}
+  READING_INTERVAL_SECONDS: ${READING_INTERVAL_SECONDS:-5}
+  SIM_START: ${SIM_START:-2026-01-01T00:00:00+00:00}
+  RANDOM_SEED: ${RANDOM_SEED:-42}
+  DUPLICATE_RATE: ${DUPLICATE_RATE:-0.02}
+  INVALID_RATE: ${INVALID_RATE:-0.01}
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_TOPIC: ${KAFKA_TOPIC:-meter-readings}
+  POSTGRES_HOST: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+  POSTGRES_USER: ${POSTGRES_USER:-smartgrid}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartgrid}
+  DATA_DIR: /data
+  WINDOW_MINUTES: ${WINDOW_MINUTES:-120}
+  WATERMARK_MINUTES: ${WATERMARK_MINUTES:-60}
+  READINESS_TIMEOUT_SECONDS: ${READINESS_TIMEOUT_SECONDS:-180}
+  STALE_AFTER_SECONDS: ${STALE_AFTER_SECONDS:-30}
+  INVALID_RATE_THRESHOLD: ${INVALID_RATE_THRESHOLD:-0.05}
+  LOW_RENEWABLE_THRESHOLD: ${LOW_RENEWABLE_THRESHOLD:-0.10}
+  DASHBOARD_REFRESH_SECONDS: ${DASHBOARD_REFRESH_SECONDS:-5}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  TZ: UTC
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/app.Dockerfile
+  image: smartgrid-app:1.0
+  environment: *sim-env
+  volumes:
+    - ./data:/data
+  restart: unless-stopped
+
+x-airflow: &airflow
+  image: apache/airflow:2.10.5-python3.11
+  user: "50000:0"
+  environment:
+    <<: *sim-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-smartgrid}:${POSTGRES_PASSWORD:-smartgrid}@postgres:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW__SCHEDULER__PARSING_PROCESSES: "1"
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__WEBSERVER__WORKERS: "2"
+    AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT: "300"
+    AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: "300"
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-local-demo-secret-change-me}
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    BILLING_POLL_SECONDS: ${BILLING_POLL_SECONDS:-30}
+    PYTHONPATH: /opt/project
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./smartgrid:/opt/project/smartgrid:ro
+    - ./sql:/opt/project/sql:ro
+    - ./data:/data
+  depends_on:
+    airflow-init:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16.4
+    shm_size: 256mb
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-smartgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-smartgrid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartgrid}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:3.8.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    ports:
+      - "${KAFKA_HOST_PORT:-29092}:29092"
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  # One-shot: create the topic (3 partitions, keyed by household_id).
+  kafka-init:
+    image: apache/kafka:3.8.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists
+        --topic ${KAFKA_TOPIC:-meter-readings} --partitions 3 --replication-factor 1 &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --describe --topic ${KAFKA_TOPIC:-meter-readings}
+    restart: "no"
+
+  # One-shot: create databases (smartgrid, airflow), apply schema, prepare ./data dirs.
+  db-init:
+    <<: *app
+    environment:
+      <<: *sim-env
+      AIRFLOW_DB_NAME: airflow
+    command: ["python", "-m", "smartgrid.db_init"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  simulator:
+    <<: *app
+    command: ["python", "-m", "simulator.meter_simulator"]
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+
+  spark-streaming:
+    build:
+      context: .
+      dockerfile: docker/spark.Dockerfile
+    image: smartgrid-spark:1.0
+    command: ["python", "-m", "spark_jobs.stream_processor"]
+    environment:
+      <<: *sim-env
+      CHECKPOINT_DIR: /checkpoints
+      READINGS_TRIGGER: ${READINGS_TRIGGER:-5 seconds}
+      WINDOW_TRIGGER: ${WINDOW_TRIGGER:-10 seconds}
+      SPARK_DRIVER_MEMORY: ${SPARK_DRIVER_MEMORY:-1g}
+    volumes:
+      - spark-checkpoints:/checkpoints
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Airflow: one-shot metadata migration + admin user, then scheduler and webserver as separate
+  # containers so a slow/crashed UI can never take billing down with it.
+  airflow-init:
+    <<: *airflow
+    command:
+      - bash
+      - -c
+      - >-
+        airflow db migrate &&
+        (airflow users create --username ${AIRFLOW_ADMIN_USER:-admin} --password ${AIRFLOW_ADMIN_PASSWORD:-admin}
+        --firstname Demo --lastname Admin --role Admin --email admin@example.com || true)
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  airflow-scheduler:
+    <<: *airflow
+    command: ["scheduler"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8974/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  airflow-webserver:
+    <<: *airflow
+    command: ["webserver"]
+    ports:
+      - "${AIRFLOW_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 10
+      start_period: 90s
+
+  dashboard:
+    <<: *app
+    command: ["streamlit", "run", "dashboard/app.py", "--server.port=8501", "--server.address=0.0.0.0",
+              "--server.headless=true", "--browser.gatherUsageStats=false"]
+    ports:
+      - "${DASHBOARD_HOST_PORT:-8501}:8501"
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  api:
+    <<: *app
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  # Test runner (docker compose --profile test run --rm tests). Mounts the working tree.
+  tests:
+    image: smartgrid-spark:1.0
+    build:
+      context: .
+      dockerfile: docker/spark.Dockerfile
+    profiles: ["test"]
+    command: ["python", "-m", "pytest", "-v", "tests"]
+    environment:
+      <<: *sim-env
+      TEST_POSTGRES_DB: smartgrid_test
+      DATA_DIR: /tmp/data
+    volumes:
+      - .:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pgdata:
+  kafkadata:
+  spark-checkpoints:

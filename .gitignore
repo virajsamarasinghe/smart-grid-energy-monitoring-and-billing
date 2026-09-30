@@ -21,3 +21,12 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+### Smart-grid project ###
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
+data/*
+!data/.gitkeep
+.kilo/
